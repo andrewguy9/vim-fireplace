@@ -6,7 +6,7 @@ endif
 let g:autoloaded_fireplace_nrepl = 1
 
 function! s:function(name) abort
-  return function(substitute(a:name,'^s:',matchstr(expand('<sfile>'), '<SNR>\d\+_'),''))
+  return function(substitute(a:name,'^s:',matchstr(expand('<sfile>'), '.*\zs<SNR>\d\+_'),''))
 endfunction
 
 if !exists('s:id')
@@ -98,6 +98,8 @@ function! fireplace#nrepl#combine(responses)
         let combined[key] = response[key]
       elseif key ==# 'value'
         let combined.value = extend(get(combined, 'value', []), [response.value])
+      elseif key ==# 'pprint-out'
+        let combined['pprint-out'] = extend(get(combined, 'pprint-out', []), [response['pprint-out']])
       elseif key ==# 'status'
         for entry in response[key]
           if index(combined[key], entry) < 0
@@ -130,19 +132,19 @@ function! s:nrepl_eval(expr, ...) dict abort
   let msg = {"op": "eval"}
   let msg.code = a:expr
   let options = a:0 ? a:1 : {}
-  if has_key(options, 'ns')
-    let msg.ns = options.ns
-  elseif has_key(self, 'ns')
+
+  for [k, v] in items(options)
+    let msg[tr(k, '_', '-')] = v
+  endfor
+
+  if !has_key(msg, 'ns') && has_key(self, 'ns')
     let msg.ns = self.ns
   endif
-  if has_key(options, 'session')
-    let msg.session = options.session
-  endif
-  if has_key(options, 'id')
-    let msg.id = options.id
-  else
+
+  if !has_key(msg, 'id')
     let msg.id = fireplace#nrepl#next_id()
   endif
+
   if has_key(options, 'file_path')
     let msg.op = 'load-file'
     let msg['file-path'] = options.file_path
@@ -177,17 +179,53 @@ function! s:nrepl_eval(expr, ...) dict abort
   if has_key(response, 'value')
     let response.value = response.value[-1]
   endif
+  " If pretty print was requested, value won't be set, so replace it with
+  " this. Assume all downstream who ask for pprinted values can handle
+  " pprinted values.
+  if has_key(response, 'pprint-out')
+    let response.value = join(response['pprint-out'], '')
+  endif
+
   return response
+endfunction
+
+function! s:process_stacktrace_entry(entry) abort
+  if !has_key(a:entry, 'class')
+    return ''
+  endif
+  let str = a:entry.class.'.'.a:entry.method
+  if !empty(get(a:entry, 'file'))
+    let str .= '('.a:entry.file.':'.a:entry.line.')'
+  endif
+  return str
 endfunction
 
 function! s:extract_last_stacktrace(nrepl, session) abort
   if a:nrepl.has_op('stacktrace')
-    let stacktrace = filter(a:nrepl.message({'op': 'stacktrace', 'session': a:session}), 'has_key(v:val, "file")')
+    let stacktrace = a:nrepl.message({'op': 'stacktrace', 'session': a:session})
+    if len(stacktrace) > 0 && has_key(stacktrace[0], 'stacktrace')
+      let stacktrace = stacktrace[0].stacktrace
+    endif
+
+    call map(stacktrace, 's:process_stacktrace_entry(v:val)')
+    call filter(stacktrace, '!empty(v:val)')
     if !empty(stacktrace)
-      return map(stacktrace, 'v:val.class.".".v:val.method."(".v:val.file.":".v:val.line.")"')
+      return stacktrace
     endif
   endif
-  let format_st = '(symbol (str "\n\b" (apply str (interleave (repeat "\n") (map str (.getStackTrace *e)))) "\n\b\n"))'
+  let format_st =
+        \ '(let [st (or (when (= "#''cljs.core/str" (str #''str))' .
+        \               ' (.-stack *e))' .
+        \             ' (.getStackTrace *e))]' .
+        \  ' (symbol' .
+        \    ' (str "\n\b"' .
+        \         ' (if (string? st)' .
+        \           ' st' .
+        \           ' (let [parts (if (= "class [Ljava.lang.StackTraceElement;" (str (type st)))' .
+        \                         ' (map str st)' .
+        \                         ' (seq (amap st idx ret (str (aget st idx)))))]' .
+        \             ' (apply str (interleave (repeat "\n") parts))))' .
+        \         ' "\n\b\n")))'
   let response = a:nrepl.process({'op': 'eval', 'code': '['.format_st.' *3 *2 *1]', 'ns': 'user', 'session': a:session})
   try
     let stacktrace = split(get(split(response.value[0], "\n\b\n"), 1, ""), "\n")
